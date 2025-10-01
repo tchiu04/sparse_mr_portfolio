@@ -117,89 +117,12 @@ class SparsePortfolio:
         self.active_assets = set()
         self.weights = np.zeros(n_assets)
         
-    def initialize_random(self, seed: int = None):
-        """Initialize with L random active assets and random weights"""
-        if seed is not None:
-            np.random.seed(seed)
-            
-        # Select L random assets
-        self.active_assets = set(np.random.choice(self.n_assets, self.L, replace=False))
-        
-        # Assign random weights (can be positive or negative for long/short)
-        self.weights = np.zeros(self.n_assets)
-        for asset in self.active_assets:
-            self.weights[asset] = np.random.randn()
-            
-        # Normalize weights to sum to 1
-        if np.sum(np.abs(self.weights)) > 1e-12:
-            self.weights = self.weights / np.sum(np.abs(self.weights))
-    
-    def initialize_greedy(self, X: np.ndarray, Gamma0: np.ndarray, Gamma1: np.ndarray):
-        """Initialize using greedy selection for better starting point"""
-        # Use greedy forward selection to get a good starting portfolio
-        _, A = compute_VAR_matrices(X)
-        selected = []
-        
-        # Greedy selection process
-        for step in range(min(self.L, self.n_assets)):
-            best_score = -np.inf
-            best_asset = None
-            best_weights = None
-            
-            candidates = [i for i in range(self.n_assets) if i not in selected]
-            if not candidates:
-                break
-                
-            for candidate in candidates:
-                trial_indices = selected + [candidate]
-                
-                # Extract submatrices
-                G0_S = Gamma0[np.ix_(trial_indices, trial_indices)]
-                A_S = A[np.ix_(trial_indices, trial_indices)]
-                
-                try:
-                    # Solve eigenvalue problem
-                    vals, vecs = eigh(A_S @ G0_S @ A_S.T, G0_S)
-                    top_w = vecs[:, np.argmax(vals)]
-                    
-                    if np.linalg.norm(top_w) > 1e-12:
-                        top_w = top_w / np.linalg.norm(top_w)
-                    
-                    score = predictability_VAR(top_w, G0_S, A_S)
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_asset = candidate
-                        best_weights = top_w
-                        
-                except Exception:
-                    continue
-            
-            if best_asset is not None:
-                selected.append(best_asset)
-            else:
-                break
-        
-        # Set the portfolio to the greedy solution
-        if len(selected) > 0 and best_weights is not None:
-            self.active_assets = set(selected)
-            self.weights = np.zeros(self.n_assets)
-            for i, idx in enumerate(selected):
-                self.weights[idx] = best_weights[i]
-        
     def set_weights(self, active_indices: List[int], active_weights: np.ndarray):
         """Set portfolio weights for specific active assets"""
         self.active_assets = set(active_indices)
         self.weights = np.zeros(self.n_assets)
         for i, idx in enumerate(active_indices):
             self.weights[idx] = active_weights[i]
-            
-    def copy(self):
-        """Create a deep copy of the portfolio"""
-        new_portfolio = SparsePortfolio(self.n_assets, self.L)
-        new_portfolio.active_assets = self.active_assets.copy()
-        new_portfolio.weights = self.weights.copy()
-        return new_portfolio
     
     def get_predictability(self, Gamma0: np.ndarray, Gamma1: np.ndarray) -> float:
         """Calculate predictability of current portfolio"""
@@ -209,155 +132,126 @@ class SparsePortfolio:
 # METHOD 1: EXHAUSTIVE SEARCH
 # ============================================================================
 
-def exhaustive_search(X: np.ndarray, L: int, verbose: bool = True) -> Tuple[SparsePortfolio, float]:
+def exhaustive_search_from_VAR(Gamma0: np.ndarray, A: np.ndarray, L: int,
+                                verbose: bool = True) -> Tuple["SparsePortfolio", float]:
     """
-    🧮 Exhaustive Search: Try all (n choose L) subsets
-    
-    Pros: ✅ Guaranteed optimal solution
-    Cons: ❌ Exponentially slow (use only for n ≤ 12)
-    
+    🧮 Exhaustive Search: Try all (n choose L) subsets using precomputed Gamma0 and A
+
     Args:
-        X: T x n returns matrix
-        L: Number of assets to select
-        verbose: Print progress
-    
+        Gamma0: n x n contemporaneous covariance matrix
+        A: VAR(1) transition matrix (n x n)
+        L: number of assets in the sparse portfolio
+        verbose: whether to print progress
+
     Returns:
-        best_portfolio: Optimal sparse portfolio
-        best_score: Best predictability score achieved
+        best_portfolio: SparsePortfolio instance with best subset
+        best_score: highest predictability score achieved
     """
-    if verbose:
-        print(f"🧮 EXHAUSTIVE SEARCH: Trying all combinations of {L} assets...")
-    
-    Gamma0, A = compute_VAR_matrices(X)
-    n = X.shape[1]
-    
-    # Check feasibility
+    n = Gamma0.shape[0]
+
     total_combinations = np.math.comb(n, L)
     if total_combinations > 10000:
-        raise ValueError(f"Too many combinations ({total_combinations:,})! Use n ≤ 12 for exhaustive search.")
-    
+        raise ValueError(f"Too many combinations ({total_combinations:,})! Limit to n ≤ 12 for exhaustive search.")
+
     if verbose:
-        print(f"Testing {total_combinations:,} combinations...")
-    
+        print(f"\n🧮 EXHAUSTIVE SEARCH: Testing all {total_combinations:,} subsets of {L} assets...")
+
     best_score = -np.inf
     best_portfolio = None
-    
+
     for i, subset in enumerate(combinations(range(n), L)):
         S = list(subset)
-        
-        # Extract submatrices
+
         G0_S = Gamma0[np.ix_(S, S)]
         A_S = A[np.ix_(S, S)]
-        
-        # Solve generalized eigenvalue problem: A_S G0_S A_S^T v = λ G0_S v
+
         try:
             vals, vecs = eigh(A_S @ G0_S @ A_S.T, G0_S)
             top_w = vecs[:, np.argmax(vals)]
-            
-            # Normalize
-            if np.linalg.norm(top_w) > 1e-12:
-                top_w = top_w / np.linalg.norm(top_w)
-            
-            # Calculate predictability
-            score = predictability_VAR(top_w, G0_S, A_S)
-            
+            top_w /= np.linalg.norm(top_w)
+
+            # Compute full-padded weights for predictability scoring
+            w_full = np.zeros(n)
+            for j, idx in enumerate(S):
+                w_full[idx] = top_w[j]
+
+            numerator = w_full.T @ A @ Gamma0 @ A.T @ w_full
+            denominator = w_full.T @ Gamma0 @ w_full
+            score = numerator / denominator if abs(denominator) > 1e-12 else 0.0
+
             if score > best_score:
                 best_score = score
-                best_portfolio = SparsePortfolio(n, L)
+                best_portfolio = SparsePortfolio(n_assets=n, L=L)
                 best_portfolio.set_weights(S, top_w)
-                
+
         except Exception as e:
             if verbose and i == 0:
-                print(f"Warning: Numerical issue in subset {S}: {e}")
+                print(f"Warning in subset {S}: {e}")
             continue
-    
-    if verbose:
-        print(f"✅ Found optimal solution with predictability: {best_score:.6f}")
-    
-    return best_portfolio, best_score
 
+    if verbose:
+        print(f"✅ Best predictability found: {best_score:.6f}")
+
+    return best_portfolio, best_score
 # ============================================================================
 # METHOD 2: GREEDY FORWARD SELECTION
 # ============================================================================
 
-def greedy_forward_selection(X: np.ndarray, L: int, verbose: bool = True) -> Tuple[SparsePortfolio, float]:
+def greedy_from_VAR_matrices(Gamma0: np.ndarray, A: np.ndarray, L: int,
+                              n_assets: int = None, verbose: bool = True) -> Tuple[SparsePortfolio, float]:
     """
-    ⚙️ Greedy Forward Selection: Build portfolio one asset at a time
-    
-    Pros: ✅ Fast, intuitive
-    Cons: ❌ Greedy, may miss global optimum
-    
-    Args:
-        X: T x n returns matrix
-        L: Number of assets to select
-        verbose: Print progress
-    
-    Returns:
-        best_portfolio: Greedy-optimal sparse portfolio
-        final_score: Final predictability score
+    Greedy selection using precomputed VAR matrices (Gamma0 and A).
     """
-    if verbose:
-        print(f"⚙️ GREEDY SELECTION: Building portfolio incrementally...")
-    
-    Gamma0, A = compute_VAR_matrices(X)
-    n = X.shape[1]
+    n = Gamma0.shape[0] if n_assets is None else n_assets
     selected = []
-    
+
     for step in range(L):
-        best_improvement = -np.inf
+        best_score = -np.inf
         best_asset = None
         best_weights = None
-        
-        # Try adding each remaining asset
+
         candidates = [i for i in range(n) if i not in selected]
-        
         for candidate in candidates:
-            trial_indices = selected + [candidate]
-            
-            # Extract submatrices
-            G0_S = Gamma0[np.ix_(trial_indices, trial_indices)]
-            A_S = A[np.ix_(trial_indices, trial_indices)]
-            
+            S = selected + [candidate]
+            G0_S = Gamma0[np.ix_(S, S)]
+            A_S = A[np.ix_(S, S)]
+
             try:
-                # Solve eigenvalue problem
                 vals, vecs = eigh(A_S @ G0_S @ A_S.T, G0_S)
                 top_w = vecs[:, np.argmax(vals)]
-                
-                if np.linalg.norm(top_w) > 1e-12:
-                    top_w = top_w / np.linalg.norm(top_w)
-                
-                score = predictability_VAR(top_w, G0_S, A_S)
-                
-                if score > best_improvement:
-                    best_improvement = score
+                top_w /= np.linalg.norm(top_w)
+
+                w_full = np.zeros(n)
+                for i, idx in enumerate(S):
+                    w_full[idx] = top_w[i]
+
+                numerator = w_full.T @ A @ Gamma0 @ A.T @ w_full
+                denominator = w_full.T @ Gamma0 @ w_full
+                score = numerator / denominator if abs(denominator) > 1e-12 else 0.0
+
+                if score > best_score:
+                    best_score = score
                     best_asset = candidate
                     best_weights = top_w
-                    
             except Exception:
                 continue
-        
+
         if best_asset is not None:
             selected.append(best_asset)
             if verbose:
-                asset_name = f"Asset_{best_asset}"
-                print(f"  Step {step+1}: Added {asset_name}, predictability = {best_improvement:.6f}")
+                print(f"Step {step+1}: Added asset {best_asset}, predictability = {best_score:.6f}")
         else:
-            if verbose:
-                print(f"  Step {step+1}: No improvement found, stopping early")
             break
-    
-    # Create final portfolio
-    final_portfolio = SparsePortfolio(n, len(selected))
-    if best_weights is not None and len(selected) > 0:
-        final_portfolio.set_weights(selected, best_weights)
-        final_score = best_improvement
+
+    # Final sparse portfolio
+    portfolio = SparsePortfolio(n, L)
+    if best_weights is not None:
+        portfolio.set_weights(selected, best_weights)
+        score = portfolio.get_predictability(Gamma0, A)
     else:
-        final_score = 0.0
-    
-    if verbose:
-        print(f"✅ Greedy selection complete with {len(selected)} assets, predictability: {final_score:.6f}")
-    
-    return final_portfolio, final_score
+        score = 0.0
+
+    return portfolio, score
 
 # ============================================================================
 # METHOD 3: SIMULATED ANNEALING (Paper-Compliant Rewrite)
