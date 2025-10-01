@@ -24,42 +24,26 @@ warnings.filterwarnings('ignore')
 
 def compute_covariance_matrices(returns: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Compute Γ₀ (contemporaneous) and Γ₁ (lag-1) covariance matrices
-    
-    Args:
-        returns: T x n matrix of returns (T time periods, n assets)
-    
-    Returns:
-        Gamma0: n x n contemporaneous covariance matrix
-        Gamma1: n x n lag-1 cross-covariance matrix
+    Compute Γ₀ (contemporaneous) and Γ₁ (lag-1) covariance matrices.
+    returns: T x n matrix of returns (T time periods, n assets)
     """
-    # Remove any NaN values
-    returns_clean = returns[~np.isnan(returns).any(axis=1)]
-    x_t = returns_clean[1:]      # t = 1, 2, ..., T-1
-    x_t_minus_1 = returns_clean[:-1]  # t = 0, 1, ..., T-2
-    
-    # Γ₀ = E[x_t x_t^T] (contemporaneous covariance)    
-    # Γ₁ = E[x_t x_{t-1}^T] (lag-1 cross-covariance)
+    returns = np.asarray(returns)
+    if returns.ndim == 1:  # single asset case
+        returns = returns.reshape(-1, 1)
 
-    Gamma0 = (x_t.T @ x_t) / (x_t.shape[0] - 1)
-    Gamma1 = (x_t.T @ x_t_minus_1) / (x_t.shape[0] - 1)
-    
+    x_t = returns[1:]            # shape (T-1, n)
+    x_t_minus_1 = returns[:-1]   # shape (T-1, n)
+
+    Tm1 = x_t.shape[0]
+
+    # Γ₀ = Cov(x_t, x_t)
+    Gamma0 = (x_t.T @ x_t) / (Tm1 - 1)
+
+    # Γ₁ = Cov(x_t, x_{t-1})
+    Gamma1 = (x_t.T @ x_t_minus_1) / (Tm1 - 1)
+
     return Gamma0, Gamma1
 
-def compute_VAR_matrices(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Alternative interface for compatibility with paper notation
-    Returns (Gamma0, A) where A is transition matrix from VAR(1): x_t = A x_{t-1} + ε_t
-    """
-    Gamma0, Gamma1 = compute_covariance_matrices(X)
-    
-    # Estimate A = Γ₁ Γ₀⁻¹ (VAR(1) transition matrix)
-    try:
-        A = Gamma1 @ np.linalg.pinv(Gamma0)
-    except:
-        A = Gamma1 @ np.linalg.pinv(Gamma0, rcond=1e-10)
-    
-    return Gamma0, A
 
 def predictability_measure(weights: np.ndarray, Gamma0: np.ndarray, Gamma1: np.ndarray) -> float:
     """
@@ -73,7 +57,7 @@ def predictability_measure(weights: np.ndarray, Gamma0: np.ndarray, Gamma1: np.n
     if abs(denominator) < 1e-12:
         return 0.0
     
-    return numerator / denominator
+    return float(numerator / denominator)
 
 def predictability_VAR(weights: np.ndarray, Gamma0: np.ndarray, A: np.ndarray) -> float:
     """
@@ -86,7 +70,39 @@ def predictability_VAR(weights: np.ndarray, Gamma0: np.ndarray, A: np.ndarray) -
     if abs(denominator) < 1e-12:
         return 0.0
         
-    return numerator / denominator
+    return float(numerator / denominator)
+
+def solve_eigenvalue_portfolio(A: np.ndarray, Gamma0: np.ndarray) -> np.ndarray:
+    """
+    Solve the generalized eigenvalue problem for optimal portfolio weights.
+    
+    Solves: (A Γ₀ A^T) w = λ Γ₀ w
+    
+    Args:
+        A: VAR(1) transition matrix (n x n)
+        Gamma0: Contemporaneous covariance matrix (n x n)
+    
+    Returns:
+        top_w: Normalized optimal portfolio weights (n,)
+    """
+    # Left matrix: A Γ₀ A^T
+    LHS = A @ Gamma0 @ A.T
+    
+    # Right matrix: Γ₀
+    RHS = Gamma0
+    
+    # Solve the generalized eigenvalue problem
+    vals, vecs = eigh(LHS, RHS)
+    
+    # Pick the eigenvector with the largest eigenvalue
+    top_idx = np.argmax(vals)
+    top_w = vecs[:, top_idx]
+    
+    # Normalize weights
+    if np.linalg.norm(top_w) > 1e-12:
+        top_w = top_w / np.linalg.norm(top_w)
+    
+    return top_w
 
 # ============================================================================
 # SPARSE PORTFOLIO CLASS
