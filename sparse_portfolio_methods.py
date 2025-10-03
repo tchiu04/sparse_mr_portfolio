@@ -128,6 +128,66 @@ class SparsePortfolio:
         """Calculate predictability of current portfolio"""
         return predictability_measure(self.weights, Gamma0, Gamma1)
 
+    def copy(self):
+        """Create a deep copy of the portfolio"""
+        new_portfolio = SparsePortfolio(self.n_assets, self.L)
+        new_portfolio.active_assets = self.active_assets.copy()
+        new_portfolio.weights = self.weights.copy()
+        return new_portfolio
+
+    def initialize_greedy(self, X: np.ndarray, Gamma0: np.ndarray, Gamma1: np.ndarray):
+        """Initialize using greedy selection for better starting point"""
+        # Use greedy forward selection to get a good starting portfolio
+        _, A = compute_VAR_matrices(X)
+        selected = []
+
+        # Greedy selection process
+        for step in range(min(self.L, self.n_assets)):
+            best_score = -np.inf
+            best_asset = None
+            best_weights = None
+
+            candidates = [i for i in range(self.n_assets) if i not in selected]
+            if not candidates:
+                break
+
+            for candidate in candidates:
+                trial_indices = selected + [candidate]
+
+                # Extract submatrices
+                G0_S = Gamma0[np.ix_(trial_indices, trial_indices)]
+                A_S = A[np.ix_(trial_indices, trial_indices)]
+
+                try:
+                    # Solve eigenvalue problem
+                    vals, vecs = eigh(A_S @ G0_S @ A_S.T, G0_S)
+                    top_w = vecs[:, np.argmax(vals)]
+
+                    if np.linalg.norm(top_w) > 1e-12:
+                        top_w = top_w / np.linalg.norm(top_w)
+
+                    score = predictability_VAR(top_w, G0_S, A_S)
+
+                    if score > best_score:
+                        best_score = score
+                        best_asset = candidate
+                        best_weights = top_w
+
+                except Exception:
+                    continue
+
+            if best_asset is not None:
+                selected.append(best_asset)
+            else:
+                break
+
+        # Set the portfolio to the greedy solution
+        if len(selected) > 0 and best_weights is not None:
+            self.active_assets = set(selected)
+            self.weights = np.zeros(self.n_assets)
+            for i, idx in enumerate(selected):
+                self.weights[idx] = best_weights[i]
+
 # ============================================================================
 # METHOD 1: EXHAUSTIVE SEARCH
 # ============================================================================
@@ -536,73 +596,52 @@ def simulated_annealing(X: np.ndarray, L: int, max_iterations: int = 10000,
 # ============================================================================
 # METHOD 4: TRUNCATION
 # ============================================================================
+def truncation_method(Gamma0: np.ndarray, A: np.ndarray, top_w: np.ndarray, L: int) -> Tuple["SparsePortfolio", float]:
+    """
+    ✂️ Truncation: Keep top-L absolute weights from full solution and re-solve in reduced space
 
-def truncation_method(X: np.ndarray, L: int, verbose: bool = True) -> Tuple[SparsePortfolio, float]:
-    """
-    ✂️ Truncation: Solve unconstrained, then keep top L weights
-    
-    Pros: ✅ Very fast, good baseline
-    Cons: ❌ Ignores combinatorial structure, suboptimal
-    
     Args:
-        X: T x n returns matrix
-        L: Number of assets to select
-        verbose: Print progress
-    
+        Gamma0: n x n contemporaneous covariance matrix
+        A: n x n VAR(1) transition matrix
+        top_w: full weight vector from unconstrained solution (e.g., top eigenvector)
+        L: number of assets to keep
+
     Returns:
-        sparse_portfolio: Truncated sparse portfolio
-        score: Predictability score
+        sparse_portfolio: re-optimized sparse portfolio
+        score: predictability score
     """
-    if verbose:
-        print(f"✂️ TRUNCATION METHOD: Solving unconstrained then keeping top {L} weights...")
-    
-    Gamma0, A = compute_VAR_matrices(X)
-    n = X.shape[1]
-    
-    try:
-        # Step 1: Solve full unconstrained generalized eigenvalue problem
-        vals, vecs = eigh(A @ Gamma0 @ A.T, Gamma0)
-        top_w = vecs[:, np.argmax(vals)]
-        
-        # Step 2: Select L largest absolute weights (paper's truncation step)
-        abs_weights = np.abs(top_w)
-        top_L_indices = np.argsort(abs_weights)[-L:]
-        
-        # Step 3: Re-solve in reduced L×L space (paper's key step!)
-        G_prime = Gamma0[np.ix_(top_L_indices, top_L_indices)]
-        AGA_prime = (A @ Gamma0 @ A.T)[np.ix_(top_L_indices, top_L_indices)]
-        
-        # Solve generalized eigenvalue problem in reduced space
-        vals_reduced, vecs_reduced = eigh(AGA_prime, G_prime)
-        optimal_weights_reduced = vecs_reduced[:, np.argmax(vals_reduced)]
-        
-        # Normalize reduced weights
-        if np.linalg.norm(optimal_weights_reduced) > 1e-12:
-            optimal_weights_reduced = optimal_weights_reduced / np.linalg.norm(optimal_weights_reduced)
-        
-        # Create sparse portfolio with re-optimized weights
-        sparse_portfolio = SparsePortfolio(n, L)
-        sparse_portfolio.set_weights(top_L_indices.tolist(), optimal_weights_reduced)
-        
-        # Calculate final score using re-optimized weights
-        score = sparse_portfolio.get_predictability(Gamma0, A @ Gamma0 @ A.T)
-        
-        if verbose:
-            print(f"✅ Truncation complete! Selected assets: {sorted(top_L_indices)}")
-            print(f"   Predictability: {score:.6f}")
-        
-        return sparse_portfolio, score
-        
-    except Exception as e:
-        if verbose:
-            print(f"❌ Truncation failed: {e}")
-        
-        # Fallback: random selection
-        fallback_portfolio = SparsePortfolio(n, L)
-        fallback_portfolio.initialize_random()
-        fallback_score = fallback_portfolio.get_predictability(Gamma0, A @ Gamma0 @ A.T)
-        
-        return fallback_portfolio, fallback_score
+    n = Gamma0.shape[0]
+
+    # Step 1: Select top-L weights
+    abs_w = np.abs(top_w)
+    top_indices = np.argsort(abs_w)[-L:]
+    top_indices = sorted(top_indices)  # optional: sort for readability
+
+    # Step 2: Slice reduced matrices
+    G0_L = Gamma0[np.ix_(top_indices, top_indices)]
+    AGA_L = (A @ Gamma0 @ A.T)[np.ix_(top_indices, top_indices)]
+
+    # Step 3: Solve reduced eigenproblem
+    vals, vecs = eigh(AGA_L, G0_L)
+    w_reduced = vecs[:, np.argmax(vals)]
+    w_reduced /= np.linalg.norm(w_reduced)
+
+    # Step 4: Expand back to full dimension
+    full_w = np.zeros(n)
+    for i, idx in enumerate(top_indices):
+        full_w[idx] = w_reduced[i]
+
+    # Step 5: Score predictability
+    numerator = full_w.T @ A @ Gamma0 @ A.T @ full_w
+    denominator = full_w.T @ Gamma0 @ full_w
+    score = numerator / denominator if abs(denominator) > 1e-12 else 0.0
+
+    # Step 6: Create portfolio
+    portfolio = SparsePortfolio(n, L)
+    portfolio.set_weights(top_indices, w_reduced)
+
+    return portfolio, score
+
 
 # ============================================================================
 # COMPARISON FRAMEWORK
@@ -611,7 +650,7 @@ def truncation_method(X: np.ndarray, L: int, verbose: bool = True) -> Tuple[Spar
 def compare_all_methods(X: np.ndarray, L: int, asset_names: List[str] = None, 
                        run_exhaustive: bool = None, verbose: bool = True) -> pd.DataFrame:
     """
-    Compare all four optimization methods
+    Compare all four optimization methods using precomputed VAR matrices
     
     Args:
         X: T x n returns matrix
@@ -622,10 +661,18 @@ def compare_all_methods(X: np.ndarray, L: int, asset_names: List[str] = None,
     
     Returns:
         comparison_df: DataFrame with results from all methods
+        results: Dictionary with detailed results from each method
     """
     n = X.shape[1]
     if asset_names is None:
         asset_names = [f"Asset_{i}" for i in range(n)]
+    
+    # Precompute VAR matrices once for all methods
+    Gamma0, Gamma1 = compute_covariance_matrices(X)
+    A = Gamma1 @ np.linalg.pinv(Gamma0)
+    
+    # Compute full unconstrained solution for truncation method
+    top_w = solve_eigenvalue_portfolio(A, Gamma0)
     
     # Decide whether to run exhaustive search
     if run_exhaustive is None:
@@ -644,7 +691,7 @@ def compare_all_methods(X: np.ndarray, L: int, asset_names: List[str] = None,
     # Method 1: Exhaustive Search
     if run_exhaustive:
         try:
-            portfolio, score = exhaustive_search(X, L, verbose)
+            portfolio, score = exhaustive_search_from_VAR(Gamma0, A, L, verbose)
             results['Exhaustive'] = {
                 'portfolio': portfolio,
                 'score': score,
@@ -663,7 +710,7 @@ def compare_all_methods(X: np.ndarray, L: int, asset_names: List[str] = None,
     
     # Method 2: Greedy Selection
     try:
-        portfolio, score = greedy_forward_selection(X, L, verbose)
+        portfolio, score = greedy_from_VAR_matrices(Gamma0, A, L, n, verbose)
         results['Greedy'] = {
             'portfolio': portfolio,
             'score': score,
@@ -676,15 +723,15 @@ def compare_all_methods(X: np.ndarray, L: int, asset_names: List[str] = None,
             print(f"❌ Greedy selection failed: {e}")
         results['Greedy'] = None
     
-    # Method 3: Simulated Annealing (Paper-Compliant)
+    # Method 3: Simulated Annealing (still uses old interface)
     try:
         portfolio, score, _ = simulated_annealing(X, L, verbose=verbose)
         results['SimAnnealing'] = {
             'portfolio': portfolio,
-            'score': score,  # Now returns predictability (negative energy)
+            'score': score,
             'selected_assets': [asset_names[i] for i in sorted(portfolio.active_assets)],
             'weights': portfolio.weights[portfolio.weights != 0],
-            'method': 'Simulated Annealing (Paper-Compliant)'
+            'method': 'Simulated Annealing'
         }
     except Exception as e:
         if verbose:
@@ -693,7 +740,7 @@ def compare_all_methods(X: np.ndarray, L: int, asset_names: List[str] = None,
     
     # Method 4: Truncation
     try:
-        portfolio, score = truncation_method(X, L, verbose)
+        portfolio, score = truncation_method(Gamma0, A, top_w, L)
         results['Truncation'] = {
             'portfolio': portfolio,
             'score': score,
